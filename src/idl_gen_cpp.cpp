@@ -320,6 +320,8 @@ class CppGenerator : public BaseGenerator {
     if (parser_.uses_flexbuffers_) {
       code_ += "#include \"flatbuffers/flexbuffers.h\"";
     }
+
+    code_ += "#include <unordered_map>";
     code_ += "";
 
     if (opts_.include_dependence_headers) { GenIncludeDependencies(); }
@@ -2097,6 +2099,87 @@ class CppGenerator : public BaseGenerator {
 
       // Generate a comparison function for this field if it is a key.
       if (field.key) { GenKeyFieldMethods(field); }
+    }
+
+    // Generate the serializers.
+    std::vector<std::string> serializable_fields;
+    for (auto it = struct_def.fields.vec.begin();
+         it != struct_def.fields.vec.end(); ++it) {
+      const auto &field = **it;
+      if (field.deprecated) {
+        // Skip deprecated fields
+        continue;
+      }
+
+      std::string call;
+      std::string field_name = Name(field);
+      std::string field_getter = field_name + "()";
+      const bool is_scalar = IsScalar(field.value.type.base_type);
+      const bool is_string = field.value.type.base_type == BASE_TYPE_STRING;
+      const bool is_vector_of_strings = field.value.type.base_type == BASE_TYPE_VECTOR && field.value.type.element == BASE_TYPE_STRING;
+      if (is_scalar) {
+        call = "builder.AddElement<" + GenTypeBasic(field.value.type, false) + ">(offset, ";
+        call += GenUnderlyingCast(field, false, field_getter) + ", " + GenDefaultConstant(field) + ")";
+      } else if (is_string) {
+        call = "auto toffset = builder.CreateString(" + field_getter + " != nullptr ? " + field_getter + "->c_str() : \"\");";
+        call += "\n    builder.AddOffset(offset, toffset);";
+        call += "\n    uoffset = toffset.o";
+      } else if (is_vector_of_strings) {
+        std::string string_offset_type = "flatbuffers::Offset<flatbuffers::String>";
+        call = "if (" + field_getter + " != nullptr) {";
+        call += "\n      std::vector<" + string_offset_type + "> strs;";
+        call += "\n      for (size_t i = 0; i < " + field_getter + "->size(); i++) {";
+        call += "\n        strs.push_back(builder.CreateString((*" + field_getter + ")[i]->c_str()));";
+        call += "\n      }";
+        call += "\n      auto toffset = builder.CreateVector<" + string_offset_type + ">(strs);";
+        call += "\n      builder.AddOffset(offset, toffset);";
+        call += "\n      uoffset = toffset.o;";
+        call += "\n    }";
+      } else {
+        // TODO: other types
+        continue;
+      }
+
+      code_.SetValue("FIELD_NAME", field_name);
+      code_.SetValue("BUILDER_TYPE", "flatbuffers::FlatBufferBuilder");
+      code_.SetValue("VOFFSET_TYPE", "flatbuffers::voffset_t");
+      code_.SetValue("CALL", call);
+      code_ += "  flatbuffers::uoffset_t serialize_{{FIELD_NAME}}({{BUILDER_TYPE}} &builder, {{VOFFSET_TYPE}} offset) const {";
+      code_ += "    flatbuffers::uoffset_t uoffset = 0;";
+      code_ += "    {{CALL}};";
+      code_ += "    return uoffset;";
+      code_ += "  }";
+
+      serializable_fields.push_back(field_name);
+    }
+
+    if (serializable_fields.size() > 0) {
+      code_ += "  flatbuffers::uoffset_t SerializeField(flatbuffers::FlatBufferBuilder &builder";
+      code_ += "    , flatbuffers::voffset_t offset, const std::string &field) const {";
+
+      // typedef
+      std::string qs = struct_def.defined_namespace->GetFullyQualifiedName(Name(struct_def));
+      qs = TranslateNameSpace(qs) + "::*FieldSerializer";
+      code_ += "    typedef flatbuffers::uoffset_t (" + qs + ")(flatbuffers::FlatBufferBuilder &, flatbuffers::voffset_t) const;";
+
+      // serializer table
+      code_ += "    static const std::unordered_map<std::string, FieldSerializer> st = {";
+      for (const auto &sf : serializable_fields) {
+        std::string qsf = struct_def.defined_namespace->GetFullyQualifiedName(Name(struct_def));
+        qsf = "&" + TranslateNameSpace(qsf) + "::serialize_" + sf;
+        code_ += "      {\"" + sf + "\", " + qsf + "},";
+      }
+
+      code_ += "    };";
+
+      // find
+      code_ += "    auto found = st.find(field);";
+      code_ += "    if (found == st.end()) {";
+      code_ += "      return 0;";
+      code_ += "    }";
+      code_ += "    auto fp = found->second;";
+      code_ += "    return (this->*fp)(builder, offset);";
+      code_ += "  }";
     }
 
     // Generate a verifier function that can check a buffer from an untrusted
